@@ -3,7 +3,6 @@ use crate::tmc5160::traits::SpiDevice;
 use std::error::Error;
 use std::io::{self, Write};
 
-
 use esp_idf_hal::delay::FreeRtos;
 // Register definitions and constants remain unchanged
 const REG_GCONF: u8 = 0x00;
@@ -91,18 +90,21 @@ impl Tmc5160 {
     }
 
     pub fn init(&mut self) -> Result<(), Box<dyn Error>> {
-        log::info!("Waiting 100ms for power-up...");
-        FreeRtos::delay_ms(100);
+        log::info!("Waiting 1000ms for power-up...");
+        FreeRtos::delay_ms(1000);
 
         let mut gconf = 0x00000000;
+
         if self.config.stealthchop.enable {
             gconf |= GCONF_EN_PWM_MODE;
         }
         gconf |= GCONF_SHAFT;
+
         self.write_register("GCONF", REG_GCONF, gconf)?;
 
-        let ihold_irun = ((self.config.current.run_current as u32) << 8)
-            | (self.config.current.hold_current as u32);
+        let ihold_irun = ((self.config.current.hold_current as u32) << 24)
+            | ((self.config.current.run_current as u32) << 16);
+
         self.write_register("IHOLD_IRUN", REG_IHOLD_IRUN, ihold_irun)?;
 
         self.write_register("SGTHRS", REG_SGTHRS, self.config.coolstep.sgthrs as u32)?;
@@ -120,7 +122,7 @@ impl Tmc5160 {
         if self.config.dcstep.enable {
             sw_mode |= 0x00000400;
         }
-        self.write_register("SW_MODE", REG_SW_MODE, sw_mode)?;
+        // self.write_register("SW_MODE", REG_SW_MODE, sw_mode)?;
 
         log::info!("Waiting 100ms after initialization...");
         FreeRtos::delay_ms(100);
@@ -138,37 +140,40 @@ impl Tmc5160 {
         Ok(())
     }
 
-pub fn rotate_by_angle(&mut self, angle: f64, rpm: f64) -> Result<(), Box<dyn Error>> {
-    let steps_per_revolution = self.config.motor_params.steps_per_revolution as f64;
-    let microsteps = self.config.microsteps.microsteps as f64;
-    let total_steps = (angle / 360.0 * steps_per_revolution * microsteps).round() as i32;
-    let steps = total_steps.abs();
+    pub fn rotate_by_angle(&mut self, angle: f64, rpm: f64) -> Result<(), Box<dyn Error>> {
+        let steps_per_revolution = self.config.motor_params.steps_per_revolution as f64;
+        let microsteps = self.config.microsteps.microsteps as f64;
+        let total_steps = (angle / 360.0 * steps_per_revolution * microsteps).round() as i32;
+        let steps = total_steps.abs();
 
-    self.log_driver_status()?;
+        self.log_driver_status()?;
 
-    let period_micros = 60.0 * 1_000_000.0 / (rpm * steps_per_revolution * microsteps);
-    let pulse_width_micros = 5;
-    let delay_micros = if period_micros > pulse_width_micros as f64 {
-        period_micros - pulse_width_micros as f64
-    } else {
-        0.0
-    };
+        let period_micros = 60.0 * 1_000_000.0 / (rpm * steps_per_revolution * microsteps);
+        let pulse_width_micros = 5;
+        let delay_micros = if period_micros > pulse_width_micros as f64 {
+            period_micros - pulse_width_micros as f64
+        } else {
+            0.0
+        };
 
-    if total_steps > 0 {
-        self.config.pins.dir_pin.set_high().expect("Error setting dir pin high");
-    } else {
-        self.config.pins.dir_pin.set_low().expect("Error setting dir pin low");
+        let dir_pin = &mut self.config.pins.dir_pin;
+        let step_pin = &mut self.config.pins.step_pin;
+
+        if total_steps > 0 {
+            dir_pin.set_high().expect("Error setting dir pin high");
+        } else {
+            dir_pin.set_low().expect("Error setting dir pin low");
+        }
+
+        for _ in 0..steps {
+            step_pin.set_high().expect("Error setting step pin high");
+            FreeRtos::delay_ms(pulse_width_micros as u32);
+            step_pin.set_low().expect("Error setting step pin low");
+            FreeRtos::delay_ms(delay_micros as u32);
+        }
+
+        Ok(())
     }
-
-    for _ in 0..steps {
-        self.config.pins.step_pin.set_high().expect("Error setting step pin high");
-        FreeRtos::delay_ms(pulse_width_micros as u32);
-        self.config.pins.step_pin.set_low().expect("Error setting step pin low");
-        FreeRtos::delay_ms(delay_micros as u32);
-    }
-
-    Ok(())
-}
 
     fn configure_chopconf(&self) -> u32 {
         let mut chopconf: u32 = 0;
@@ -222,7 +227,9 @@ pub fn rotate_by_angle(&mut self, angle: f64, rpm: f64) -> Result<(), Box<dyn Er
     ) -> Result<(), Box<dyn Error>> {
         log::info!(
             "Writing {}: Register 0x{:02X}, Value: 0x{:08X}",
-            name, address, value
+            name,
+            address,
+            value
         );
         let buffer = [
             address | 0x80,
@@ -232,13 +239,14 @@ pub fn rotate_by_angle(&mut self, angle: f64, rpm: f64) -> Result<(), Box<dyn Er
             value as u8,
         ];
 
-        self.read_register(name, address).expect("Error reading register");
+        self.spi
+            .write(&buffer)
+            .expect("Error writing to SPI device");
 
-        self.spi.write(&buffer).expect("Error writing to SPI device");
+        FreeRtos::delay_ms(100);
 
-        FreeRtos::delay_ms(10);
-
-        self.read_register(name, address).expect("Error reading register");
+        self.read_register(name, address)
+            .expect("Error reading register");
 
         // if response_buffer != value {
         //     log::error!("Error writing {}: Register 0x{:02X}, Value: 0x{:08X}", name, address, value);
@@ -248,22 +256,25 @@ pub fn rotate_by_angle(&mut self, angle: f64, rpm: f64) -> Result<(), Box<dyn Er
         Ok(())
     }
 
-    fn read_register(&mut self, name: &str, address: u8) -> Result<u32, Box<dyn Error>> {
+    pub fn read_register(&mut self, name: &str, address: u8) -> Result<u32, Box<dyn Error>> {
         let cmd = [address & 0x7F, 0, 0, 0, 0];
         let mut response = [0u8; 5];
 
-        self.spi.transfer(&mut response, &cmd).expect("Error reading from SPI device");
+        self.spi
+            .transfer(&mut response, &cmd)
+            .expect("Error reading from SPI device");
 
         FreeRtos::delay_ms(10);
 
-        let response_value = u32::from_be_bytes([
-            response[1],
-            response[2],
-            response[3],
-            response[4],
-        ]);
+        let response_value =
+            u32::from_be_bytes([response[1], response[2], response[3], response[4]]);
 
-        log::info!("Reading {}: Register 0x{:02X}, Value: 0x{:08X}", name, address, response_value);
+        log::info!(
+            "Reading {}: Register 0x{:02X}, Value: 0x{:08X}",
+            name,
+            address,
+            response_value
+        );
 
         Ok(response_value)
     }

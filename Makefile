@@ -1,7 +1,7 @@
 build:
 	cargo build
 flash:
-	espflash ./target/xtensa-esp32s3-espidf/debug/esp-stepper
+	espflash flash ./target/xtensa-esp32s3-espidf/debug/esp-stepper
 monitor:
 	espflash monitor
 clean:
