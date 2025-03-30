@@ -1,4 +1,4 @@
-use crate::tmc5160::traits::DigitalOutputPin;
+use crate::tmc_driver::traits::DigitalOutputPin;
 use esp_idf_hal::gpio::{Output, PinDriver, AnyOutputPin};
 use std::error::Error;
 
