@@ -2,6 +2,7 @@
 name = "esp-stepper"
 version = "0.1.0"
 authors = ["Iurii <angkira0@gmail.com>"]
+description = "ESP32 Stepper Motor Control via TMC drivers"
 edition = "2021"
 resolver = "2"
 
@@ -29,3 +30,25 @@ esp-idf-sys = "0.36.1"
 
 [build-dependencies]
 embuild = "0.33"
+
+[package]
+exclude = [
+    ".cargo/",
+    ".devcontainer/",
+    ".embuild/",
+    ".github/",
+    ".vscode/",
+    "docs/",         
+    "scripts/",
+    "examples/",     
+    ".dockerignore",
+    "build.rs",     
+    "Cargo.lock",    
+    "diagram.json",
+    "Makefile",
+    "rust-toolchain.toml", 
+    "sdkconfig.defaults",
+    "wokwi.toml",
+    "target/", 
+    "src/main.rs",
+]
