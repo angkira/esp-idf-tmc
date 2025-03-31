@@ -26,4 +26,8 @@ impl DigitalOutputPin for EspIdfDigitalOutputPin {
         self.pin_driver.set_low()?;
         Ok(())
     }
+
+    fn get_num(&self) -> u32 {
+        self.pin_driver.pin() as u32
+    }
 }

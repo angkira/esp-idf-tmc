@@ -1,6 +1,17 @@
-use std::error::Error;
 use crate::tmc_driver::pin::PinSettings;
 use crate::tmc_driver::traits::SpiDevice;
+use esp_idf_hal::gpio::AnyOutputPin;
+use esp_idf_hal::rmt::RmtChannel;
+use std::error::Error;
+// Use AnyOutputPin for flexibility
+
+// #[derive(Debug, Clone, Copy)]
+pub struct RmtStepperConfig<'d> {
+    pub step_rmt_channel: i8, // RMT Channel number (0-7 depending on ESP32 variant)
+    pub step_pin_gpio: AnyOutputPin,      // GPIO number for STEP output
+    pub rmt_clk_divider: u8,    // RMT clock divider (e.g., 8 for 10MHz)
+    pub pulse_width_us: u8, // Pulse width in microseconds
+}
 
 #[derive(Debug)]
 pub struct MotorParams {
@@ -34,7 +45,8 @@ pub struct SpreadCycleSettings {
     pub hend: u8,
 }
 
-pub struct TMCBaseConfig {
+pub struct TMCBaseConfig<'d> {
+    pub rmt: RmtStepperConfig<'d>,
     pub pins: PinSettings,
     pub current: CurrentSettings,
     pub microsteps: MicrostepSettings,
@@ -43,20 +55,22 @@ pub struct TMCBaseConfig {
     pub spreadcycle: SpreadCycleSettings,
 }
 
-pub struct TMCConfig<FeatureConfig> {
-    pub base: TMCBaseConfig,
+pub struct TMCConfig<'d, FeatureConfig> {
+    pub base: TMCBaseConfig<'d>,
     pub feature: FeatureConfig,
 }
 
-pub struct TMCDriver<FeatureConfig> {
+pub struct TMCDriver<'d, FeatureConfig> {
     spi: Box<dyn SpiDevice>,
-    config: TMCConfig<FeatureConfig>,
+    config: TMCConfig<'d, FeatureConfig>,
 }
 
 pub trait TMCDriverInterface<FeatureConfig> {
     fn new(spi: Box<dyn SpiDevice>, config: TMCConfig<FeatureConfig>) -> Self;
 
     fn init(&mut self) -> Result<(), Box<dyn Error>>;
+
+    fn init_rmt(&mut self) -> Result<(), Box<dyn Error>>;
 
     fn rotate_by_angle(&mut self, angle: f64, rpm: f64) -> Result<(), Box<dyn Error>>;
 
@@ -72,4 +86,15 @@ pub trait TMCDriverInterface<FeatureConfig> {
     ) -> Result<(), Box<dyn Error>>;
 
     fn read_register(&mut self, name: &str, address: u8) -> Result<u32, Box<dyn Error>>;
+
+    fn enable(&mut self) -> Result<(), Box<dyn Error>>;
+
+    fn disable(&mut self) -> Result<(), Box<dyn Error>>;
+
+    fn move_steps_rmt(
+        &mut self,
+        steps: u32,
+        rpm: f64,
+        // Direction is now handled separately/before calling
+    ) -> Result<(), Box<dyn Error>>;
 }

@@ -2,7 +2,11 @@ use std::error::Error;
 
 pub trait DigitalOutputPin: Send + Sync {
     fn set_high(&mut self) -> Result<(), Box<dyn Error>>;
+
     fn set_low(&mut self) -> Result<(), Box<dyn Error>>;
+
+    fn get_num(&self) -> u32;
+
 }
 
 pub trait SpiDevice {

@@ -1,10 +1,13 @@
-use crate::tmc_driver::pin::PinSettings;
+use crate::tmc_driver::driver_settings::{TMCConfig, TMCDriverInterface};
 use crate::tmc_driver::traits::SpiDevice;
+use esp_idf_hal::delay::Ets;
 use std::error::Error;
 use std::io::{self, Write};
-
-use crate::tmc_driver::driver_settings::{TMCConfig, TMCDriverInterface};
-use esp_idf_hal::delay::Ets;
+use esp_idf_hal::peripheral::Peripheral;
+use esp_idf_hal::peripherals::Peripherals;
+use esp_idf_hal::rmt::config::TransmitConfig;
+use esp_idf_hal::rmt::{PinState, Pulse, PulseTicks, RmtChannel, TxRmtDriver, VariableLengthSignal}; // Import specific channel if known, or use generics
+use log::info;
 
 fn delay_us(micros: u32) {
     Ets::delay_us(micros);
@@ -54,17 +57,27 @@ pub struct TMC5160Features {
     pub dcstep: DcStepConfig,
 }
 
-pub struct Tmc5160 {
+pub struct Tmc5160<'d> {
     spi: Box<dyn SpiDevice>,
-    config: TMCConfig<TMC5160Features>,
+    config: TMCConfig<'d, TMC5160Features>,
+    tx_rmt_driver: Option<TxRmtDriver<'d>>,
 }
 
-impl TMCDriverInterface<TMC5160Features> for Tmc5160 {
-    fn new(spi: Box<dyn SpiDevice>, config: TMCConfig<TMC5160Features>) -> Tmc5160 {
-        Tmc5160 { spi, config }
+impl TMCDriverInterface<TMC5160Features> for Tmc5160<'_> {
+    fn new(
+        spi: Box<dyn SpiDevice>,
+        config: TMCConfig<TMC5160Features>,
+    ) -> Tmc5160<'static> {
+        Tmc5160 {
+            spi,
+            config,
+            tx_rmt_driver: None,
+        }
     }
 
     fn init(&mut self) -> Result<(), Box<dyn Error>> {
+        self.enable()?;
+
         log::info!("Waiting 1000ms for power-up...");
         delay_ms(1000); // Power-up delay
 
@@ -137,6 +150,7 @@ impl TMCDriverInterface<TMC5160Features> for Tmc5160 {
         );
         self.spi
             .write_register(REG_SGTHRS, self.config.feature.coolstep.sgthrs as u32)?;
+
         match self.spi.read_register(REG_SGTHRS) {
             Ok((status, value)) => log::info!(
                 "Reading SGTHRS: Status 0x{:02X}, Value: 0x{:08X}",
@@ -260,6 +274,40 @@ impl TMCDriverInterface<TMC5160Features> for Tmc5160 {
         Ok(())
     }
 
+    fn init_rmt<'d>(&mut self) -> Result<(), Box<dyn Error>> {
+        let peripherals = Peripherals::take()?;
+        let rmt = peripherals.rmt;
+        let rmt_config = &self.config.base.rmt;
+        info!(
+            "Initializing RMT Stepper on Channel {}...",
+            rmt_config.step_rmt_channel
+        );
+
+        let tx_config = TransmitConfig::new().clock_divider(rmt_config.rmt_clk_divider);
+
+        let channel = match &rmt_config.step_rmt_channel {
+            0 => &rmt.channel0,
+            1 => &rmt.channel1,
+            2 => &rmt.channel2,
+            3 => &rmt.channel3,
+            4 => &rmt.channel4,
+            5 => &rmt.channel5,
+            6 => &rmt.channel6,
+            7 => &rmt.channel7,
+            _ => panic!("Invalid RMT channel")
+        };
+
+        // Create the RMT Transmit Driver
+        let tx_driver = TxRmtDriver::new(
+            &rmt,                         // RMT peripheral
+            channel, // The selected RMT channel
+            &tx_config,                   // RMT transmit configuration
+        )?;
+
+        let rmt_clk_hz = tx_driver.counter_clock()?;
+        info!("RMT counter clock configured to: {} Hz", rmt_clk_hz.0);
+    }
+
     fn rotate_by_angle(&mut self, angle: f64, rpm: f64) -> Result<(), Box<dyn Error>> {
         let steps_per_revolution = self.config.base.motor_params.steps_per_revolution as f64;
         let microsteps = self.config.base.microsteps.microsteps as f64;
@@ -269,7 +317,7 @@ impl TMCDriverInterface<TMC5160Features> for Tmc5160 {
         self.log_driver_status()?;
 
         let period_micros = 60.0 * 1_000_000.0 / (rpm * steps_per_revolution * microsteps);
-        let pulse_width_micros = 5;
+        let pulse_width_micros = self.config.base.rmt.pulse_width_us as f64;
         let delay_micros = if period_micros > pulse_width_micros as f64 {
             period_micros - pulse_width_micros as f64
         } else {
@@ -279,7 +327,6 @@ impl TMCDriverInterface<TMC5160Features> for Tmc5160 {
         delay_us(100);
 
         let dir_pin = &mut self.config.base.pins.dir_pin;
-        let step_pin = &mut self.config.base.pins.step_pin;
 
         if total_steps > 0 {
             dir_pin.set_high().expect("Error setting dir pin high");
@@ -289,12 +336,70 @@ impl TMCDriverInterface<TMC5160Features> for Tmc5160 {
 
         delay_us(100);
 
-        for _ in 0..steps {
-            step_pin.set_high().expect("Error setting step pin high");
-            delay_us(pulse_width_micros as u32);
-            step_pin.set_low().expect("Error setting step pin low");
-            delay_us(delay_micros as u32);
+        self.move_steps_rmt(steps.abs() as u32, rpm)?;
+
+        Ok(())
+    }
+
+    fn move_steps_rmt(
+        &mut self,
+        steps: u32,
+        rpm: f64,
+        // Direction is now handled separately/before calling
+    ) -> Result<(), Box<dyn Error>> {
+        let steps_per_revolution = self.config.base.motor_params.steps_per_revolution as f64;
+        let microsteps_per_step = self.config.base.microsteps.microsteps as f64; // Assuming this is microsteps per FULL step
+
+        // Calculate period in nanoseconds for higher precision with RMT ticks
+        let period_ns = (60.0 * 1_000_000_000.0
+            / (rpm * steps_per_revolution * microsteps_per_step))
+            .max(1000.0); // Min period 1000ns = 1us
+
+        // Define pulse width (e.g., 2-5 us) in nanoseconds
+        let pulse_width_ns: u32 = 2_000; // 2 microseconds = 2000 nanoseconds
+
+        // Calculate delay between pulses in nanoseconds
+        let delay_ns = if period_ns > pulse_width_ns as f64 {
+            (period_ns - pulse_width_ns as f64).max(2000.0) as u32 // Ensure minimum delay (e.g., 2us)
+        } else {
+            2_000 // Minimum delay if period is very short
+        };
+
+        let mut tx_driver = self.tx_rmt_driver.as_mut().unwrap();
+
+        let ticks_hz = &tx_driver.counter_clock()?; // Get the actual RMT counter clock frequency
+        let ns_per_tick = 1_000_000_000u64 / ticks_hz.0 as u64;
+
+        let high_ticks = (pulse_width_ns as u64 / ns_per_tick) as u16;
+        let low_ticks = (delay_ns as u64 / ns_per_tick) as u16;
+
+        let high_ticks = PulseTicks::new(high_ticks)?;
+        let low_ticks = PulseTicks::new(low_ticks)?;
+
+        // Define the pulse sequence for a single step (HIGH then LOW)
+        let pulses = [
+            Pulse::new(PinState::High, high_ticks), // Step pulse HIGH
+            Pulse::new(PinState::Low, low_ticks),   // Delay before next step LOW
+        ];
+
+        // Create a signal containing the pulse repeated 'steps' times
+        // Note: RMT buffer size is limited. Very large 'steps' might require chunking.
+        // The default buffer size (usually 64 items * number of memory blocks) limits the
+        // number of *Pulse* elements (high + low = 2 elements per step) you can send at once.
+        // For 1 memory block, this is ~32 steps per transmission.
+        // We will send pulses iteratively for simplicity and robustness with large step counts.
+
+        let mut signal = VariableLengthSignal::new();
+        &signal.push(&pulses)?;
+        // Send pulses iteratively
+        for i in 0..steps {
+            // Use start_blocking to send the two pulses for one step and wait for completion
+            &tx_driver.start_blocking(&signal)?;
+            if (i + 1) % 100 == 0 { // Optional: Log progress for long moves
+                log::debug!("Sent {} steps...", i + 1);
+            }
         }
+        log::info!("RMT transmission finished.");
 
         Ok(())
     }
@@ -316,7 +421,7 @@ impl TMCDriverInterface<TMC5160Features> for Tmc5160 {
         chopconf |= mres << 24; // Use correct shift amount
 
         // Blank time (TBL) bits 16..15 - Setting TBL=%01 (24 clocks)
-        chopconf |= (1 << 15); // Set bit 15 for TBL = %01
+        chopconf |= 1 << 15; // Set bit 15 for TBL = %01
 
         if self.config.base.spreadcycle.enable && !self.config.base.stealthchop.enable {
             // SpreadCycle specific bits
@@ -379,8 +484,6 @@ impl TMCDriverInterface<TMC5160Features> for Tmc5160 {
                 Err(e) // Propagate the error
             }
         }
-        // Removed the automatic read-after-write and delay from here.
-        // Verification reads should be done explicitly after calling this method if needed.
     }
 
     /// Helper method to read a register via the SPI device.
@@ -405,9 +508,17 @@ impl TMCDriverInterface<TMC5160Features> for Tmc5160 {
             }
         }
     }
+
+    fn enable(&mut self) -> Result<(), Box<dyn Error>> {
+        self.config.base.pins.enable_pin.set_low()
+    }
+
+    fn disable(&mut self) -> Result<(), Box<dyn Error>> {
+        self.config.base.pins.enable_pin.set_high()
+    }
 }
 
-impl Tmc5160 {
+impl Tmc5160<'_> {
     fn log_driver_status(&mut self) -> Result<(), Box<dyn Error>> {
         match self.spi.read_register(REG_DRV_STATUS) {
             Ok((status, drv_status_val)) => {
