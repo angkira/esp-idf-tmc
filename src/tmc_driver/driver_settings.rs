@@ -1,14 +1,14 @@
 use crate::tmc_driver::pin::PinSettings;
 use crate::tmc_driver::traits::SpiDevice;
-use esp_idf_hal::gpio::AnyOutputPin;
-use esp_idf_hal::rmt::RmtChannel;
+use esp_idf_hal::gpio::{AnyOutputPin, OutputPin};
+use esp_idf_hal::rmt::{CHANNEL0, RMT};
 use std::error::Error;
+use esp_idf_hal::peripheral::Peripheral;
+use esp_idf_hal::rmt;
 // Use AnyOutputPin for flexibility
 
 // #[derive(Debug, Clone, Copy)]
-pub struct RmtStepperConfig<'d> {
-    pub step_rmt_channel: i8, // RMT Channel number (0-7 depending on ESP32 variant)
-    pub step_pin_gpio: AnyOutputPin,      // GPIO number for STEP output
+pub struct RmtStepperConfig {
     pub rmt_clk_divider: u8,    // RMT clock divider (e.g., 8 for 10MHz)
     pub pulse_width_us: u8, // Pulse width in microseconds
 }
@@ -45,8 +45,8 @@ pub struct SpreadCycleSettings {
     pub hend: u8,
 }
 
-pub struct TMCBaseConfig<'d> {
-    pub rmt: RmtStepperConfig<'d>,
+pub struct TMCBaseConfig {
+    pub rmt: RmtStepperConfig,
     pub pins: PinSettings,
     pub current: CurrentSettings,
     pub microsteps: MicrostepSettings,
@@ -55,22 +55,24 @@ pub struct TMCBaseConfig<'d> {
     pub spreadcycle: SpreadCycleSettings,
 }
 
-pub struct TMCConfig<'d, FeatureConfig> {
-    pub base: TMCBaseConfig<'d>,
+pub struct TMCConfig<FeatureConfig> {
+    pub base: TMCBaseConfig,
     pub feature: FeatureConfig,
 }
 
-pub struct TMCDriver<'d, FeatureConfig> {
+pub struct TMCDriver<FeatureConfig> {
     spi: Box<dyn SpiDevice>,
-    config: TMCConfig<'d, FeatureConfig>,
+    config: TMCConfig<FeatureConfig>,
 }
 
-pub trait TMCDriverInterface<FeatureConfig> {
+pub trait TMCDriverInterface<'a, FeatureConfig> {
     fn new(spi: Box<dyn SpiDevice>, config: TMCConfig<FeatureConfig>) -> Self;
 
-    fn init(&mut self) -> Result<(), Box<dyn Error>>;
+    fn init(&mut self, rmt_channel: impl Peripheral<P = impl rmt::RmtChannel> + 'a,
+            step_pin: impl Peripheral<P = impl OutputPin> + 'a) -> Result<(), Box<dyn Error>>;
 
-    fn init_rmt(&mut self) -> Result<(), Box<dyn Error>>;
+    fn init_rmt(&mut self, rmt_channel: impl Peripheral<P = impl rmt::RmtChannel> + 'a,
+                step_pin: impl Peripheral<P = impl OutputPin> + 'a) -> Result<(), Box<dyn Error>>;
 
     fn rotate_by_angle(&mut self, angle: f64, rpm: f64) -> Result<(), Box<dyn Error>>;
 
