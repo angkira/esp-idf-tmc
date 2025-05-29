@@ -5,10 +5,9 @@ use std::error::Error;
 use std::io::{self, Write};
 use esp_idf_hal::gpio::OutputPin;
 use esp_idf_hal::peripheral::Peripheral;
-use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::rmt;
 use esp_idf_hal::rmt::config::TransmitConfig;
-use esp_idf_hal::rmt::{PinState, Pulse, PulseTicks, TxRmtDriver, VariableLengthSignal}; // Import specific channel if known, or use generics
+use esp_idf_hal::rmt::{PinState, Pulse, PulseTicks, TxRmtDriver, FixedLengthSignal};
 use log::info;
 
 fn delay_us(micros: u32) {
@@ -319,7 +318,7 @@ impl<'a> TMCDriverInterface<'a, TMC5160Features> for Tmc5160<'a> {
 
         let period_micros = 60.0 * 1_000_000.0 / (rpm * steps_per_revolution * microsteps);
         let pulse_width_micros = self.config.base.rmt.pulse_width_us as f64;
-        let delay_micros = if period_micros > pulse_width_micros as f64 {
+        let _delay_micros = if period_micros > pulse_width_micros as f64 {
             period_micros - pulse_width_micros as f64
         } else {
             0.0
@@ -462,60 +461,48 @@ impl<'a> TMCDriverInterface<'a, TMC5160Features> for Tmc5160<'a> {
         // Direction is now handled separately/before calling
     ) -> Result<(), Box<dyn Error>> {
         let steps_per_revolution = self.config.base.motor_params.steps_per_revolution as f64;
-        let microsteps_per_step = self.config.base.microsteps.microsteps as f64; // Assuming this is microsteps per FULL step
+        let microsteps_per_step = self.config.base.microsteps.microsteps as f64;
 
-        // Calculate period in nanoseconds for higher precision with RMT ticks
-        let period_ns = (60.0 * 1_000_000_000.0
+        // Calculate period in microseconds
+        let period_us = (60.0 * 1_000_000.0
             / (rpm * steps_per_revolution * microsteps_per_step))
-            .max(1000.0); // Min period 1000ns = 1us
+            .max(10.0); // Min period 10us
 
-        // Define pulse width (e.g., 2-5 us) in nanoseconds
-        let pulse_width_ns: u32 = 2_000; // 2 microseconds = 2000 nanoseconds
+        // Define pulse width in microseconds
+        let pulse_width_us: u32 = self.config.base.rmt.pulse_width_us as u32;
 
-        // Calculate delay between pulses in nanoseconds
-        let delay_ns = if period_ns > pulse_width_ns as f64 {
-            (period_ns - pulse_width_ns as f64).max(2000.0) as u32 // Ensure minimum delay (e.g., 2us)
+        // Calculate delay between pulses
+        let delay_us = if period_us > pulse_width_us as f64 {
+            (period_us - pulse_width_us as f64).max(2.0) as u32
         } else {
-            2_000 // Minimum delay if period is very short
+            2
         };
 
-        let mut tx_driver = self.tx_rmt_driver.as_mut().unwrap();
-
-        let ticks_hz = &tx_driver.counter_clock()?; // Get the actual RMT counter clock frequency
-        let ns_per_tick = 1_000_000_000u64 / ticks_hz.0 as u64;
-
-        let high_ticks = (pulse_width_ns as u64 / ns_per_tick) as u16;
-        let low_ticks = (delay_ns as u64 / ns_per_tick) as u16;
-
-        let high_ticks = PulseTicks::new(high_ticks)?;
-        let low_ticks = PulseTicks::new(low_ticks)?;
-
-        // Define the pulse sequence for a single step (HIGH then LOW)
-        let pulses = [
-            Pulse::new(PinState::High, high_ticks), // Step pulse HIGH
-            Pulse::new(PinState::Low, low_ticks),   // Delay before next step LOW
-        ];
-
-        // Create a signal containing the pulse repeated 'steps' times
-        // Note: RMT buffer size is limited. Very large 'steps' might require chunking.
-        // The default buffer size (usually 64 items * number of memory blocks) limits the
-        // number of *Pulse* elements (high + low = 2 elements per step) you can send at once.
-        // For 1 memory block, this is ~32 steps per transmission.
-        // We will send pulses iteratively for simplicity and robustness with large step counts.
-
-        let mut signal = VariableLengthSignal::new();
-        let _ = &signal.push(&pulses)?;
-        // Send pulses iteratively
-        for i in 0..steps {
-            // Use start_blocking to send the two pulses for one step and wait for completion
-            let _ = &tx_driver.start_blocking(&signal)?;
-            if (i + 1) % 100 == 0 { // Optional: Log progress for long moves
-                log::debug!("Sent {} steps...", i + 1);
+        if let Some(ref mut tx_driver) = self.tx_rmt_driver {
+            // Calculate pulse timing
+            let pulse_width_ticks = PulseTicks::new((pulse_width_us as u16) * 10)?;
+            let low_pulse_ticks = PulseTicks::new((delay_us as u16) * 10)?;
+            
+            // Create pulse pattern
+            let high_pulse = Pulse::new(PinState::High, pulse_width_ticks);
+            let low_pulse = Pulse::new(PinState::Low, low_pulse_ticks);
+            
+            // Generate steps using fixed length signals
+            for i in 0..steps {
+                let mut signal = FixedLengthSignal::<1>::new();
+                signal.set(0, &(high_pulse, low_pulse))?;
+                tx_driver.start_blocking(&signal)?;
+                
+                if (i + 1) % 100 == 0 {
+                    log::debug!("Sent {} steps...", i + 1);
+                }
             }
+            
+            log::info!("RMT transmission finished for {} steps.", steps);
+            Ok(())
+        } else {
+            Err("RMT driver not initialized".into())
         }
-        log::info!("RMT transmission finished.");
-
-        Ok(())
     }
 }
 
