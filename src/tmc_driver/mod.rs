@@ -1,4 +1,5 @@
+pub mod driver_settings;
 pub mod pin;
-pub mod tmc5160;
 pub mod traits;
-pub(crate) mod driver_settings;
+pub mod tmc5160;
+pub mod tmc2240;

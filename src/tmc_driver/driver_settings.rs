@@ -1,10 +1,10 @@
 use crate::tmc_driver::pin::PinSettings;
 use crate::tmc_driver::traits::SpiDevice;
-use esp_idf_hal::gpio::{AnyOutputPin, OutputPin};
-use esp_idf_hal::rmt::{CHANNEL0, RMT};
-use std::error::Error;
+use esp_idf_hal::gpio::OutputPin;
 use esp_idf_hal::peripheral::Peripheral;
 use esp_idf_hal::rmt;
+use std::error::Error;
+
 // Use AnyOutputPin for flexibility
 
 // #[derive(Debug, Clone, Copy)]
